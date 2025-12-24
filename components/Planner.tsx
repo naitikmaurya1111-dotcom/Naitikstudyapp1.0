@@ -1,13 +1,12 @@
-import React, { useEffect, useState, useRef } from 'react';
-import { Bell, User as UserIcon, Calendar as CalendarIcon, MoreVertical, Play, Pause, Coffee, WifiOff, Lock, Edit2, Grid, RotateCw, Check, X, Plus } from 'lucide-react';
-import { useAuth } from '../App';
+import React, { useEffect, useState } from 'react';
+import { RotateCw, Coffee, Grid, Edit2, Play, MoreVertical, WifiOff, Lock, Plus, Calendar } from 'lucide-react';
+import { useApp } from '../App';
 import { StudySession, CalendarEvent } from '../types';
-import { subscribeToTodaySessions, deleteSession, updateSessionDuration } from '../firebase';
-import { getGuestSessions, deleteGuestSession } from '../utils/localStorage';
+import { getLocalSessions, deleteLocalSession, saveLocalSession } from '../utils/localStorage';
 import { fetchCalendarEvents } from '../utils/googleCalendar';
 
 const Planner: React.FC = () => {
-  const { user, isGuest, googleToken } = useAuth();
+  const { refreshData, googleAccessToken, connectGoogleCalendar } = useApp();
   const [sessions, setSessions] = useState<StudySession[]>([]);
   const [calendarEvents, setCalendarEvents] = useState<CalendarEvent[]>([]);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -60,7 +59,6 @@ const Planner: React.FC = () => {
           const currentMin = now.getMinutes();
 
           // Planner logic: Day starts at 4 AM.
-          // If time is 00:00 - 03:59, it counts as 'late night' of previous visual day.
           if (currentHour < 4) {
               currentHour += 24;
           }
@@ -71,53 +69,66 @@ const Planner: React.FC = () => {
       };
 
       updatePosition();
-      const interval = setInterval(updatePosition, 60000); // Update every minute
+      const interval = setInterval(updatePosition, 60000); 
       return () => clearInterval(interval);
   }, []);
 
-  // 1. Fetch Study Sessions
+  // Load Local Sessions periodically
   useEffect(() => {
-    if (user && !isGuest) {
-      const unsubscribe = subscribeToTodaySessions(user.uid, (data) => {
-        const mapped = data.map(d => ({
-          ...d,
-          startTime: d.startTime && d.startTime.toDate ? d.startTime.toDate() : new Date(d.startTime),
-          endTime: d.endTime && d.endTime.toDate ? d.endTime.toDate() : new Date(d.endTime),
-        })) as StudySession[];
-        setSessions(mapped);
-      });
-      return () => unsubscribe();
-    } else if (isGuest) {
-        const loadGuestData = () => {
-            const all = getGuestSessions();
-            const now = new Date();
-            if (now.getHours() < 4) now.setDate(now.getDate() - 1);
-            now.setHours(4,0,0,0);
-            
-            const todaySessions = all.filter(s => new Date(s.startTime as Date) >= now);
-            setSessions(todaySessions);
-        };
-        loadGuestData();
-        const interval = setInterval(loadGuestData, 2000);
-        return () => clearInterval(interval);
-    }
-  }, [user, isGuest]);
+    loadSessions();
+    const interval = setInterval(loadSessions, 2000);
+    return () => clearInterval(interval);
+  }, []);
 
-  // 2. Fetch Google Calendar
+  // Fetch Calendar Events when token changes
   useEffect(() => {
-      loadCalendar();
-  }, [googleToken, isGuest]);
+    const loadCalendar = async () => {
+      if (googleAccessToken) {
+        const events = await fetchCalendarEvents(googleAccessToken);
+        const now = new Date();
+        if (now.getHours() < 4) now.setDate(now.getDate() - 1);
+        
+        // Filter for "Today" (meaning the planner's view of today starting at 4am)
+        const startOfDay = new Date(now);
+        startOfDay.setHours(4, 0, 0, 0);
+        const endOfDay = new Date(now);
+        endOfDay.setDate(endOfDay.getDate() + 1);
+        endOfDay.setHours(4, 0, 0, 0);
 
-  const loadCalendar = async () => {
-    if (googleToken && !isGuest) {
-        const events = await fetchCalendarEvents(googleToken);
-        setCalendarEvents(events);
-    }
+        const todaysEvents = events.filter(e => 
+          (e.start >= startOfDay && e.start < endOfDay) || 
+          (e.end > startOfDay && e.end <= endOfDay) ||
+          (e.start <= startOfDay && e.end >= endOfDay)
+        );
+        setCalendarEvents(todaysEvents);
+      }
+    };
+    loadCalendar();
+  }, [googleAccessToken]);
+
+  const loadSessions = () => {
+      const all = getLocalSessions();
+      const now = new Date();
+      if (now.getHours() < 4) now.setDate(now.getDate() - 1);
+      const startOfDay = new Date(now);
+      startOfDay.setHours(4, 0, 0, 0);
+      
+      const endOfDay = new Date(now);
+      endOfDay.setDate(endOfDay.getDate() + 1);
+      endOfDay.setHours(4, 0, 0, 0);
+
+      const todaySessions = all.filter(s => s.startTime >= startOfDay && s.startTime < endOfDay);
+      setSessions(todaySessions);
   };
 
   const handleRefresh = async () => {
       setIsRefreshing(true);
-      await loadCalendar();
+      loadSessions();
+      if (googleAccessToken) {
+        const events = await fetchCalendarEvents(googleAccessToken);
+        // ... simple refetch logic, ideally duplicated filter logic but fine for now
+        // or just rely on useEffect dependencies if we unset/reset something
+      }
       setTimeout(() => setIsRefreshing(false), 800);
   };
 
@@ -137,8 +148,9 @@ const Planner: React.FC = () => {
 
       if (action === 'delete') {
           if (confirm("Delete this record?")) {
-             if(user && !isGuest) await deleteSession(user.uid, s.id, s.durationSeconds);
-             else deleteGuestSession(s.id);
+             deleteLocalSession(s.id);
+             loadSessions();
+             refreshData();
           }
       } else if (action === 'edit') {
           setEditingSession(s);
@@ -153,11 +165,11 @@ const Planner: React.FC = () => {
       if (isNaN(newMinutes)) return;
       const newSeconds = newMinutes * 60;
 
-      if (user && !isGuest) {
-          await updateSessionDuration(user.uid, editingSession.id, editingSession.durationSeconds, newSeconds);
-      } else {
-          alert("Editing supported only in logged-in mode for now.");
-      }
+      const updated = { ...editingSession, durationSeconds: newSeconds };
+      saveLocalSession(updated);
+      loadSessions();
+      refreshData();
+      
       setEditingSession(null);
   };
 
@@ -165,8 +177,8 @@ const Planner: React.FC = () => {
 
   const getBlockStyle = (startInput: any, endInput: any, color: string, isStudy: boolean) => {
     if (!startInput) return {};
-    const start = startInput instanceof Date ? startInput : startInput.toDate();
-    const end = endInput ? (endInput instanceof Date ? endInput : endInput.toDate()) : new Date();
+    const start = startInput instanceof Date ? startInput : new Date(startInput);
+    const end = endInput ? (endInput instanceof Date ? endInput : new Date(endInput)) : new Date();
     
     let startHour = start.getHours();
     if (startHour < 4) startHour += 24; 
@@ -179,7 +191,6 @@ const Planner: React.FC = () => {
     const startTotalMinutes = (startHour - 4) * 60 + startMin;
     let durationMinutes = (endHour * 60 + endMin) - (startHour * 60 + startMin);
     
-    // Fallback for visual glitch if duration is negative (spanning days weirdly)
     if (durationMinutes < 0) durationMinutes = 60; 
 
     return {
@@ -216,6 +227,13 @@ const Planner: React.FC = () => {
         </div>
         <div className="flex items-center space-x-4">
             <div className="text-gray-400 text-sm">{formattedDate()}</div>
+            <button 
+                onClick={connectGoogleCalendar}
+                className={`p-1 ${googleAccessToken ? 'text-[#FF6B35]' : 'text-gray-400'}`}
+                title={googleAccessToken ? "Calendar Connected" : "Connect Google Calendar"}
+            >
+                <Calendar size={18} />
+            </button>
             <button 
                 onClick={handleRefresh}
                 className={`text-gray-400 p-1 ${isRefreshing ? 'animate-spin' : ''}`}
@@ -269,27 +287,16 @@ const Planner: React.FC = () => {
                  </div>
             </div>
 
-            {/* Google Calendar Events */}
-            {calendarEvents.map((event) => {
-                // Filter only events for "today" (considering 4AM shift)
-                const start = event.start;
-                const plannerDay = weekDates[todayIndex];
-                // Check if event falls within planner day (4am to next 4am)
-                // Simplified check: Same calendar day (rough approximation for UI)
-                const isSameDay = start.getDate() === plannerDay.getDate() && start.getMonth() === plannerDay.getMonth();
-                
-                if (!isSameDay) return null;
-
-                return (
-                    <div
-                        key={event.id}
-                        className="absolute rounded border-l-2 border-white/20 px-2 py-1 text-[10px] text-gray-300 overflow-hidden"
-                        style={getBlockStyle(event.start, event.end, '#1f2937', false)} // Dark gray for Cal events
-                    >
-                        {event.title}
-                    </div>
-                );
-            })}
+            {/* Calendar Events (Underneath) */}
+            {calendarEvents.map((event) => (
+                <div
+                    key={event.id}
+                    className="absolute border-l-4 border-blue-500 bg-blue-900/30 overflow-hidden px-2 py-1 flex flex-col justify-center"
+                    style={getBlockStyle(event.start, event.end, 'rgba(30, 64, 175, 0.3)', false)}
+                >
+                    <div className="text-[10px] text-blue-200 font-bold truncate">{event.title}</div>
+                </div>
+            ))}
 
             {/* Study Sessions */}
             {sessions.map((session) => (
@@ -315,26 +322,14 @@ const Planner: React.FC = () => {
                     <div className="flex items-center gap-2 text-sm">
                         <Coffee size={16} /> Pomodoro
                     </div>
-                    <div className="w-10 h-5 bg-gray-600 rounded-full relative cursor-pointer">
-                        <div className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full"></div>
-                    </div>
                 </div>
 
                 <div className="py-2">
                     <button onClick={() => handleMenuAction('edit')} className="w-full flex items-center px-4 py-3 text-sm hover:bg-white/5 text-gray-200 gap-3">
-                        <Edit2 size={16} /> Edit/Delete Time
+                        <Edit2 size={16} /> Edit Time
                     </button>
                     <button className="w-full flex items-center px-4 py-3 text-sm hover:bg-white/5 text-gray-200 gap-3">
-                        <Grid size={16} /> Allowed Apps Settings
-                    </button>
-                     <button className="w-full flex items-center px-4 py-3 text-sm hover:bg-white/5 text-gray-200 gap-3">
-                        <Coffee size={16} /> Rest Settings
-                    </button>
-                     <button className="w-full flex items-center px-4 py-3 text-sm hover:bg-white/5 text-gray-200 gap-3">
-                        <WifiOff size={16} /> Offline Mode
-                    </button>
-                     <button className="w-full flex items-center px-4 py-3 text-sm hover:bg-white/5 text-gray-200 gap-3">
-                        <Lock size={16} /> Blocking Apps <span className="text-[#FF6B35] text-[10px] font-bold border border-[#FF6B35] px-1 rounded ml-auto">P</span>
+                        <Grid size={16} /> Subject Tag
                     </button>
                 </div>
 
@@ -371,12 +366,6 @@ const Planner: React.FC = () => {
               </div>
           </div>
       )}
-
-      <div className="absolute bottom-6 right-6 z-40">
-          <button className="w-14 h-14 bg-[#FF6B35] rounded-full flex items-center justify-center shadow-lg hover:bg-[#e55a2b] transition-colors text-white">
-              <Plus size={32} />
-          </button>
-      </div>
     </div>
   );
 };

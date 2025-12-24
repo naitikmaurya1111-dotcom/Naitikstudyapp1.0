@@ -1,160 +1,138 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
-import { User, onAuthStateChanged } from 'firebase/auth';
-import { auth, subscribeToTodaySessions, logout as firebaseLogout, updateUserProfileName } from './firebase';
-import { Subject, AppRoute } from './types';
-import Login from './pages/Login';
+import { Subject, AppRoute, UserProfile } from './types';
 import Planner from './components/Planner';
 import TimerOverlay from './components/TimerOverlay';
 import GroupList from './components/GroupList';
 import GroupDetail from './components/GroupDetail';
 import Stats from './components/Stats';
 import Settings from './components/Settings';
+import Login from './pages/Login';
 import { Home, Users, BarChart2, Plus, Settings as SettingsIcon } from 'lucide-react';
-import { getGuestTodayTotal, setGuestMode, isGuestModeActive, getStoredSubjects, saveStoredSubject } from './utils/localStorage';
+import { 
+    getLocalProfile, 
+    getLocalSubjects, 
+    saveLocalSubject, 
+    getTodayTotalSeconds, 
+    updateLocalProfileName,
+    getConnectedRoomId,
+    getActiveSessionState,
+    saveLocalProfile
+} from './utils/localStorage';
+import { syncUserProfileToRoom, auth, loginWithGoogle } from './firebase';
+import { onAuthStateChanged } from 'firebase/auth';
 
-// --- Auth Context ---
-interface AuthContextType {
-  user: User | null;
-  isGuest: boolean;
-  googleToken: string | null;
-  loading: boolean;
-  loginAsGuest: () => void;
-  setGoogleToken: (token: string) => void;
-  logout: () => void;
-  updateName: (name: string) => Promise<void>;
+// --- Global Context ---
+interface AppContextType {
+  profile: UserProfile;
+  subjects: Subject[];
+  refreshData: () => void;
+  updateName: (name: string) => void;
+  googleAccessToken: string | null;
+  connectGoogleCalendar: () => Promise<void>;
 }
 
-const AuthContext = createContext<AuthContextType>({ 
-    user: null, 
-    isGuest: false, 
-    googleToken: null, 
-    loading: true, 
-    loginAsGuest: () => {}, 
-    setGoogleToken: () => {},
-    logout: () => {},
-    updateName: async () => {}
+const AppContext = createContext<AppContextType>({ 
+    profile: getLocalProfile(),
+    subjects: [],
+    refreshData: () => {},
+    updateName: () => {},
+    googleAccessToken: null,
+    connectGoogleCalendar: async () => {}
 });
 
+export const useApp = () => useContext(AppContext);
+
+// --- Auth Context (For Login.tsx) ---
+interface AuthContextType {
+  loginAsGuest: () => void;
+  setGoogleToken: (token: string) => void;
+}
+const AuthContext = createContext<AuthContextType>({ loginAsGuest: () => {}, setGoogleToken: () => {} });
 export const useAuth = () => useContext(AuthContext);
 
-const DEFAULT_SUBJECTS: Subject[] = [
-  { id: '1', name: 'Mathematics', color: '#008080' },
-  { id: '2', name: 'Physics', color: '#CD5C5C' },
-  { id: '3', name: 'Chemistry', color: '#708090' },
-  { id: '4', name: 'English', color: '#E9967A' },
-  { id: '5', name: 'Coding', color: '#6A5ACD' },
-];
-
 const App: React.FC = () => {
-  const [user, setUser] = useState<User | null>(null);
-  const [isGuest, setIsGuest] = useState(false);
-  const [googleToken, setGoogleToken] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  
+  const [profile, setProfile] = useState<UserProfile>(getLocalProfile());
+  const [subjects, setSubjects] = useState<Subject[]>(getLocalSubjects());
   const [activeTab, setActiveTab] = useState<AppRoute>(AppRoute.PLANNER);
   const [isTimerOpen, setIsTimerOpen] = useState(false);
-  const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
-  const [todayTotalSeconds, setTodayTotalSeconds] = useState(0);
+  const [todayTotal, setTodayTotal] = useState(0);
   
-  // Custom Subject State
-  const [subjects, setSubjects] = useState<Subject[]>(DEFAULT_SUBJECTS);
+  // Google Calendar State
+  const [googleAccessToken, setGoogleAccessToken] = useState<string | null>(null);
+  
+  // Room State
+  const [connectedRoomId, setConnectedRoomId] = useState<string | null>(getConnectedRoomId());
+  
+  // Setup State (Acts as Auth State)
+  const [isNameSetup, setIsNameSetup] = useState(!!getLocalProfile().displayName && getLocalProfile().displayName !== 'Student');
 
-  // Setup State
-  const [isNameSetup, setIsNameSetup] = useState(true);
-  const [setupName, setSetupName] = useState('');
-
+  // Initial Load & Resume Check
   useEffect(() => {
-    // 1. Check for Guest Mode in LocalStorage (Auto-Login for Guest)
-    const guestActive = isGuestModeActive();
-    if (guestActive) {
-        setIsGuest(true);
-        setLoading(false);
-        // Guests might be named "Guest" by default, force change if needed
+    refreshData();
+    
+    // Check if we were running a session when app closed
+    const savedState = getActiveSessionState();
+    if (savedState) {
+        setIsTimerOpen(true); // Open timer immediately to resume
     }
 
-    // 2. Check for Firebase User (Auto-Login for Google)
-    const unsubscribe = onAuthStateChanged(auth, (u) => {
-      if (u) {
-          setUser(u);
-          setIsGuest(false);
-          setGuestMode(false);
-          // Check if user has a name
-          if (!u.displayName) {
-             setIsNameSetup(false);
-          }
-      } else {
-          setUser(null);
-      }
-      setLoading(false);
+    // If connected to a room, sync initial presence
+    if (connectedRoomId) {
+        syncUserProfileToRoom(profile, connectedRoomId);
+    }
+
+    // Auth Listener
+    const unsub = onAuthStateChanged(auth, (user) => {
+        if (user) {
+            const current = getLocalProfile();
+            if (current.uid !== user.uid) {
+                const newProfile = {
+                    ...current,
+                    uid: user.uid,
+                    displayName: user.displayName || current.displayName,
+                    photoURL: user.photoURL || current.photoURL
+                };
+                saveLocalProfile(newProfile);
+                setProfile(newProfile);
+                setIsNameSetup(true);
+                refreshData();
+            }
+        }
     });
-
-    // 3. Load Custom Subjects
-    const stored = getStoredSubjects();
-    setSubjects([...DEFAULT_SUBJECTS, ...stored]);
-
-    return () => unsubscribe();
+    return () => unsub();
   }, []);
 
-  // Monitor Total Time
+  // Periodic Refresh
   useEffect(() => {
-    if (user && !isGuest) {
-        // Firebase Mode
-        const unsubscribe = subscribeToTodaySessions(user.uid, (sessions) => {
-            const total = sessions.reduce((acc, curr) => acc + (curr.durationSeconds || 0), 0);
-            setTodayTotalSeconds(total);
-        });
-        return () => unsubscribe();
-    } else if (isGuest) {
-        // Guest Mode
-        const updateGuestTotal = () => {
-            setTodayTotalSeconds(getGuestTodayTotal());
-        };
-        updateGuestTotal();
-        const interval = setInterval(updateGuestTotal, 5000); 
-        return () => clearInterval(interval);
-    }
-  }, [user, isGuest, isTimerOpen]);
+    const interval = setInterval(() => {
+        refreshData();
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [isTimerOpen, connectedRoomId]);
 
-  const loginAsGuest = () => {
-      setIsGuest(true);
-      setGuestMode(true);
-      setLoading(false);
-      // For Guests, we want them to set a name initially
-      setIsNameSetup(false);
+  const refreshData = () => {
+      setProfile(getLocalProfile());
+      setSubjects(getLocalSubjects());
+      setTodayTotal(getTodayTotalSeconds());
+      setConnectedRoomId(getConnectedRoomId());
   };
 
-  const logout = () => {
-      if (user) {
-          firebaseLogout();
-      }
-      setIsGuest(false);
-      setGuestMode(false); 
-      setUser(null);
+  const handleUpdateName = (name: string) => {
+      const updated = updateLocalProfileName(name);
+      setProfile(updated);
       setIsNameSetup(true);
-      setActiveTab(AppRoute.PLANNER);
-  };
-
-  const handleUpdateName = async (name: string) => {
-      if (user && !isGuest) {
-        await updateUserProfileName(user, name);
-      } else if (isGuest) {
-        // For guest, we simulate it by updating the auth context user wrapper locally if possible
-        // But since 'user' is null for guest, we handle display name locally in components or via a wrapper
-        // Here we just set state to proceed
-      }
-      // Reload logic slightly hacky for auth refresh, but for now just clear setup
-      setIsNameSetup(true);
-  };
-
-  const handleGroupSelect = (id: string) => {
-    setSelectedGroupId(id);
-    setActiveTab(AppRoute.GROUP_DETAIL);
+      refreshData();
   };
 
   const handleAddSubject = (name: string, color: string) => {
-      const newSub: Subject = { id: `custom_${Date.now()}`, name, color };
-      const updated = saveStoredSubject(newSub);
-      setSubjects([...DEFAULT_SUBJECTS, ...updated]);
+      const newSub: Subject = { id: `sub_${Date.now()}`, name, color };
+      saveLocalSubject(newSub);
+      refreshData();
+  };
+
+  const handleRoomSelect = (id: string) => {
+    // We are already connected to this room via GroupList logic
+    setActiveTab(AppRoute.GROUP_DETAIL);
   };
 
   const formatTotalTime = (seconds: number) => {
@@ -164,14 +142,39 @@ const App: React.FC = () => {
     return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
 
+  // Auth Context Implementations
+  const loginAsGuest = () => {
+    setIsNameSetup(true);
+  };
+
+  const setGoogleToken = (token: string) => {
+    setGoogleAccessToken(token);
+    setIsNameSetup(true);
+  };
+
+  const connectGoogleCalendar = async () => {
+    try {
+        const { token } = await loginWithGoogle();
+        if (token) {
+            setGoogleAccessToken(token);
+            alert("Google Calendar Connected!");
+        }
+    } catch (e) {
+        console.error("Failed to connect calendar", e);
+        alert("Failed to connect Google Calendar.");
+    }
+  };
+
+  // --- Views ---
+
   const renderContent = () => {
     switch (activeTab) {
       case AppRoute.PLANNER:
         return <Planner />;
       case AppRoute.GROUPS:
-        return <GroupList onSelectGroup={handleGroupSelect} />;
+        return <GroupList onSelectRoom={handleRoomSelect} />;
       case AppRoute.GROUP_DETAIL:
-        return <GroupDetail groupId={selectedGroupId || ''} onBack={() => setActiveTab(AppRoute.GROUPS)} />;
+        return <GroupDetail roomId={connectedRoomId || ''} onBack={() => setActiveTab(AppRoute.GROUPS)} />;
       case AppRoute.STATS:
         return <Stats />;
       case AppRoute.SETTINGS:
@@ -181,50 +184,30 @@ const App: React.FC = () => {
     }
   };
 
-  if (loading) return <div className="h-screen w-full bg-black flex items-center justify-center text-[#FF6B35]">Loading...</div>;
-  
-  if (!user && !isGuest) {
-      return (
-        <AuthContext.Provider value={{ user, isGuest, googleToken, loading, loginAsGuest, setGoogleToken, logout, updateName: handleUpdateName }}>
-            <Login />
-        </AuthContext.Provider>
-      );
-  }
-
-  // Name Setup Screen
+  // --- Login / Initial Name Setup Screen ---
   if (!isNameSetup) {
       return (
-          <div className="h-screen w-full bg-[#121212] flex items-center justify-center p-6 text-white">
-              <div className="w-full max-w-sm">
-                  <h1 className="text-2xl font-bold mb-2 text-center">Welcome!</h1>
-                  <p className="text-gray-400 mb-6 text-center">How should we call you?</p>
-                  <input 
-                    autoFocus
-                    value={setupName}
-                    onChange={(e) => setSetupName(e.target.value)}
-                    placeholder="Enter your nickname"
-                    className="w-full bg-[#1e1e1e] border border-gray-700 rounded-xl p-4 text-center text-xl text-white focus:border-[#FF6B35] outline-none mb-4"
-                  />
-                  <button 
-                    disabled={!setupName.trim()}
-                    onClick={() => handleUpdateName(setupName)}
-                    className="w-full bg-[#FF6B35] py-4 rounded-xl font-bold disabled:opacity-50"
-                  >
-                      Get Started
-                  </button>
-              </div>
-          </div>
+          <AuthContext.Provider value={{ loginAsGuest, setGoogleToken }}>
+               <Login />
+          </AuthContext.Provider>
       );
   }
 
   return (
-    <AuthContext.Provider value={{ user, isGuest, googleToken, loading, loginAsGuest, setGoogleToken, logout, updateName: handleUpdateName }}>
+    <AppContext.Provider value={{ 
+        profile, 
+        subjects, 
+        refreshData, 
+        updateName: handleUpdateName,
+        googleAccessToken,
+        connectGoogleCalendar 
+    }}>
       <div className="h-screen w-full bg-[#121212] flex flex-col overflow-hidden font-sans">
         
         <div className="flex-1 overflow-hidden relative">
           {renderContent()}
           
-          {/* Floating Mini Player (Only on Planner) */}
+          {/* Floating Timer Button (Only on Planner) */}
           {activeTab === AppRoute.PLANNER && (
             <div 
               onClick={() => setIsTimerOpen(true)}
@@ -233,7 +216,7 @@ const App: React.FC = () => {
               <div className="flex flex-col">
                 <span className="text-[10px] text-gray-500">Total Today</span>
                 <span className="text-xl font-mono font-bold text-white">
-                    {formatTotalTime(todayTotalSeconds)}
+                    {formatTotalTime(todayTotal)}
                 </span>
               </div>
               <div className="w-8 h-8 rounded-full bg-[#FF6B35] flex items-center justify-center text-white">
@@ -243,6 +226,7 @@ const App: React.FC = () => {
           )}
         </div>
 
+        {/* Navigation */}
         {activeTab !== AppRoute.GROUP_DETAIL && (
           <div className="h-16 bg-[#000000] border-t border-gray-900 flex items-center justify-around text-gray-500 pb-safe">
             <button 
@@ -257,7 +241,7 @@ const App: React.FC = () => {
               className={`flex flex-col items-center space-y-1 ${activeTab === AppRoute.GROUPS ? 'text-[#FF6B35]' : ''}`}
             >
               <Users size={22} strokeWidth={activeTab === AppRoute.GROUPS ? 2.5 : 2} />
-              <span className="text-[10px]">Group</span>
+              <span className="text-[10px]">Room</span>
             </button>
             <button 
               onClick={() => setActiveTab(AppRoute.STATS)}
@@ -284,7 +268,7 @@ const App: React.FC = () => {
         />
         
       </div>
-    </AuthContext.Provider>
+    </AppContext.Provider>
   );
 };
 

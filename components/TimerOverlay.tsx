@@ -1,9 +1,15 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Play, Pause, Square, Settings, WifiOff, Slash, Coffee, Plus, Save, RotateCcw } from 'lucide-react';
+import { Play, Pause, Square, Settings, Coffee, Plus, Save, RotateCcw } from 'lucide-react';
 import { Subject } from '../types';
-import { startStudySession, endStudySession, sendHeartbeat } from '../firebase';
-import { saveGuestSession } from '../utils/localStorage';
-import { useAuth } from '../App';
+import { 
+    saveLocalSession, 
+    saveActiveSessionState, 
+    clearActiveSessionState, 
+    getActiveSessionState, 
+    getConnectedRoomId 
+} from '../utils/localStorage';
+import { useApp } from '../App';
+import { updateRoomStatus, syncSessionToRoom } from '../firebase';
 
 interface TimerOverlayProps {
   isOpen: boolean;
@@ -12,55 +18,81 @@ interface TimerOverlayProps {
   onAddSubject: (name: string, color: string) => void;
 }
 
-// Timer States
 type TimerState = 'IDLE' | 'RUNNING' | 'PAUSED' | 'SUMMARY';
 
 const TimerOverlay: React.FC<TimerOverlayProps> = ({ isOpen, onClose, subjects, onAddSubject }) => {
-  const { user, isGuest } = useAuth();
+  const { profile, refreshData } = useApp();
   
   // State
   const [timerState, setTimerState] = useState<TimerState>('IDLE');
   const [selectedSubject, setSelectedSubject] = useState<Subject>(subjects[0]);
   const [isRestMode, setIsRestMode] = useState(false);
   const [seconds, setSeconds] = useState(0);
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  const [guestStartTime, setGuestStartTime] = useState<Date | null>(null);
+  const [sessionStartTime, setSessionStartTime] = useState<Date | null>(null);
   const [sessionMemo, setSessionMemo] = useState('');
   
-  // Add missing state for subject creation
+  // Subject Creation State
   const [isAddingSubject, setIsAddingSubject] = useState(false);
   const [newSubName, setNewSubName] = useState('');
   
   // Refs
   const intervalRef = useRef<number | null>(null);
-  const startTimeRef = useRef<number>(0);
-  const accumulatedTimeRef = useRef<number>(0);
-  const heartbeatRef = useRef<number | null>(null); // For Anti-Cheat Ping
+  const heartBeatRef = useRef<number | null>(null);
 
-  // Effect: Sync subjects
+  // 1. Resume Logic on Mount
   useEffect(() => {
-    if (subjects.length > 0 && !subjects.find(s => s.id === selectedSubject.id)) {
+      const savedState = getActiveSessionState();
+      if (savedState) {
+          // Restore state
+          const start = new Date(savedState.startTime);
+          setSessionStartTime(start);
+          setSelectedSubject(savedState.subject);
+          setTimerState('RUNNING'); // Auto-resume
+          
+          // Calculate elapsed time even while app was closed
+          const now = Date.now();
+          const elapsed = Math.floor((now - start.getTime()) / 1000);
+          setSeconds(elapsed);
+          
+          // Restart Interval
+          startTicker(start);
+      }
+  }, []);
+
+  // 2. Sync Subjects
+  useEffect(() => {
+    if (subjects.length > 0 && !selectedSubject.id) {
+        setSelectedSubject(subjects[0]);
+    } else if (subjects.length > 0 && !subjects.find(s => s.id === selectedSubject.id)) {
+        // If stored subject was deleted, default to first
         setSelectedSubject(subjects[0]);
     }
   }, [subjects]);
 
-  // Effect: Page Visibility (Focus Guard / Anti-Cheat / Heartbeat Recovery)
+  // 3. Heartbeat for Room Status
   useEffect(() => {
-    const handleVisibilityChange = () => {
-      if (document.hidden) {
-         if (timerState === 'RUNNING' && !isRestMode) {
-             console.warn("User switched tabs!");
-         }
+      if (timerState === 'RUNNING' && !isRestMode) {
+          const roomId = getConnectedRoomId();
+          if (roomId) {
+              // Initial update
+              updateRoomStatus(roomId, profile.uid, true, selectedSubject.name);
+              // Periodic update
+              heartBeatRef.current = window.setInterval(() => {
+                   updateRoomStatus(roomId, profile.uid, true, selectedSubject.name);
+              }, 30000);
+          }
       } else {
-          // User came back. Force a heartbeat to show them as online immediately.
-          if (timerState === 'RUNNING' && !isRestMode && user && !isGuest) {
-              sendHeartbeat(user.uid);
+          // Clear status if paused/stopped
+          const roomId = getConnectedRoomId();
+          if (roomId && heartBeatRef.current) {
+              updateRoomStatus(roomId, profile.uid, false);
+              clearInterval(heartBeatRef.current);
           }
       }
-    };
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
-  }, [timerState, isRestMode, user, isGuest]);
+      return () => {
+          if (heartBeatRef.current) clearInterval(heartBeatRef.current);
+      }
+  }, [timerState, isRestMode, selectedSubject]);
 
   const formatTime = (totalSeconds: number) => {
     const h = Math.floor(totalSeconds / 3600);
@@ -69,36 +101,29 @@ const TimerOverlay: React.FC<TimerOverlayProps> = ({ isOpen, onClose, subjects, 
     return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
 
-  const startTimer = async () => {
-    setTimerState('RUNNING');
-    startTimeRef.current = Date.now();
-    
-    // Start session in DB if not in rest mode
-    if (!isRestMode) {
-        if (user && !isGuest) {
-            const sid = await startStudySession(user.uid, selectedSubject.id, selectedSubject.name, selectedSubject.color);
-            setSessionId(sid);
-            
-            // START HEARTBEAT
-            // 1. Send immediately
-            sendHeartbeat(user.uid);
-            
-            // 2. Schedule interval (every 30s)
-            if (heartbeatRef.current) clearInterval(heartbeatRef.current);
-            heartbeatRef.current = window.setInterval(() => {
-                sendHeartbeat(user.uid);
-            }, 30000);
+  const startTicker = (startTime: Date) => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      intervalRef.current = window.setInterval(() => {
+          const now = Date.now();
+          const elapsed = Math.floor((now - startTime.getTime()) / 1000);
+          setSeconds(elapsed);
+      }, 1000);
+  };
 
-        } else if (isGuest) {
-            setGuestStartTime(new Date());
-        }
+  const startTimer = () => {
+    const start = new Date();
+    setSessionStartTime(start);
+    setTimerState('RUNNING');
+    
+    // Save state to local storage for "Resume" capability
+    if (!isRestMode) {
+        saveActiveSessionState({
+            startTime: start.getTime(),
+            subject: selectedSubject
+        });
     }
 
-    intervalRef.current = window.setInterval(() => {
-      const now = Date.now();
-      const elapsed = Math.floor((now - startTimeRef.current) / 1000);
-      setSeconds(accumulatedTimeRef.current + elapsed);
-    }, 1000);
+    startTicker(start);
   };
 
   const pauseTimer = () => {
@@ -106,18 +131,13 @@ const TimerOverlay: React.FC<TimerOverlayProps> = ({ isOpen, onClose, subjects, 
       window.clearInterval(intervalRef.current);
       intervalRef.current = null;
     }
-    if (heartbeatRef.current) {
-        window.clearInterval(heartbeatRef.current);
-        heartbeatRef.current = null;
-    }
     setTimerState('PAUSED');
-    accumulatedTimeRef.current = seconds;
   };
 
   const handleStopClick = () => {
       pauseTimer();
-      // If purely resting (no study session), just reset.
-      // If studying, go to Summary screen.
+      clearActiveSessionState(); // Clear resume state
+      
       if (isRestMode) {
           resetTimer();
           onClose();
@@ -127,21 +147,27 @@ const TimerOverlay: React.FC<TimerOverlayProps> = ({ isOpen, onClose, subjects, 
   };
 
   const saveAndClose = async () => {
-    // Commit the session data
-    if (!isRestMode) {
-        if (user && !isGuest && sessionId) {
-            await endStudySession(user.uid, sessionId, seconds, sessionMemo);
-        } else if (isGuest && guestStartTime) {
-            saveGuestSession({
-                userId: 'guest',
-                subjectId: selectedSubject.id,
-                subjectName: selectedSubject.name,
-                subjectColor: selectedSubject.color,
-                startTime: guestStartTime,
-                endTime: new Date(),
-                durationSeconds: seconds,
-                memo: sessionMemo
-            });
+    if (!isRestMode && sessionStartTime) {
+        const newSession = {
+            id: 'sess_' + Date.now(),
+            userId: profile.uid,
+            subjectId: selectedSubject.id,
+            subjectName: selectedSubject.name,
+            subjectColor: selectedSubject.color,
+            startTime: sessionStartTime,
+            endTime: new Date(),
+            durationSeconds: seconds,
+            memo: sessionMemo
+        };
+
+        // 1. Save Local
+        saveLocalSession(newSession);
+        refreshData();
+
+        // 2. Sync to Room (if connected)
+        const roomId = getConnectedRoomId();
+        if (roomId) {
+            syncSessionToRoom(newSession, roomId);
         }
     }
     resetTimer();
@@ -150,15 +176,10 @@ const TimerOverlay: React.FC<TimerOverlayProps> = ({ isOpen, onClose, subjects, 
 
   const resetTimer = () => {
       setSeconds(0);
-      accumulatedTimeRef.current = 0;
-      setSessionId(null);
-      setGuestStartTime(null);
+      setSessionStartTime(null);
       setSessionMemo('');
       setTimerState('IDLE');
-      if (heartbeatRef.current) {
-        window.clearInterval(heartbeatRef.current);
-        heartbeatRef.current = null;
-      }
+      if (intervalRef.current) clearInterval(intervalRef.current);
   };
 
   const handleCreateSubject = () => {
@@ -216,7 +237,7 @@ const TimerOverlay: React.FC<TimerOverlayProps> = ({ isOpen, onClose, subjects, 
   return (
     <div className={`fixed inset-0 z-50 flex flex-col items-center justify-end transition-colors duration-500 ${isRestMode ? 'bg-[#1a2e1a]' : 'bg-black'} text-white`}>
       
-      {/* Subject Selector (Hidden while running) */}
+      {/* Subject Selector */}
       <div className="w-full px-6 mb-12 h-16">
         {timerState === 'IDLE' && (
             <div className="flex overflow-x-auto space-x-4 pb-4 no-scrollbar items-center">
@@ -257,7 +278,7 @@ const TimerOverlay: React.FC<TimerOverlayProps> = ({ isOpen, onClose, subjects, 
         </div>
       </div>
 
-      {/* Quick Settings (Hidden while running) */}
+      {/* Quick Settings */}
       {timerState === 'IDLE' && (
         <div className="flex space-x-8 mb-12 text-gray-400">
             <div className="flex flex-col items-center gap-1 cursor-pointer" onClick={() => setIsRestMode(!isRestMode)}>
@@ -288,7 +309,7 @@ const TimerOverlay: React.FC<TimerOverlayProps> = ({ isOpen, onClose, subjects, 
                </button>
              ) : (
                 <button 
-                onClick={startTimer}
+                onClick={startTimer} // Resume
                 className="w-20 h-20 rounded-full bg-gray-800 flex items-center justify-center text-white hover:bg-gray-700 active:scale-95 transition-all"
               >
                 <Play size={32} fill="currentColor" />

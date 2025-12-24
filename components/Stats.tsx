@@ -1,7 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { useAuth } from '../App';
-import { subscribeToHistorySessions } from '../firebase';
-import { getGuestSessions } from '../utils/localStorage';
+import { getLocalSessions } from '../utils/localStorage';
 import { StudySession } from '../types';
 import { PieChart, Clock, Calendar } from 'lucide-react';
 
@@ -11,33 +9,15 @@ interface SubjectStat {
 }
 
 const Stats: React.FC = () => {
-  const { user, isGuest } = useAuth();
   const [sessions, setSessions] = useState<StudySession[]>([]);
   const [totalTime, setTotalTime] = useState(0);
 
   useEffect(() => {
-    if (user && !isGuest) {
-        // Updated to use history subscription for ALL TIME stats
-        const unsubscribe = subscribeToHistorySessions(user.uid, (data) => {
-             // Map and convert timestamps
-             const mapped = data.map(d => ({
-                ...d,
-                startTime: d.startTime && d.startTime.toDate ? d.startTime.toDate() : new Date(d.startTime),
-                endTime: d.endTime && d.endTime.toDate ? d.endTime.toDate() : new Date(d.endTime),
-              })) as StudySession[];
-            setSessions(mapped);
-        });
-        return () => unsubscribe();
-    } else if (isGuest) {
-        // Guest mode already loads all history from local storage
-        const all = getGuestSessions();
-        setSessions(all);
-    }
-  }, [user, isGuest]);
-
-  useEffect(() => {
-    setTotalTime(sessions.reduce((acc, curr) => acc + curr.durationSeconds, 0));
-  }, [sessions]);
+    // Load local history
+    const all = getLocalSessions();
+    setSessions(all);
+    setTotalTime(all.reduce((acc, curr) => acc + curr.durationSeconds, 0));
+  }, []);
 
   // Aggregate data by subject
   const subjectStats = sessions.reduce((acc, curr) => {
@@ -64,15 +44,13 @@ const Stats: React.FC = () => {
 
   return (
     <div className="flex flex-col h-full bg-[#121212] text-white">
-        {/* Header */}
         <div className="px-4 py-4 border-b border-gray-800 bg-[#121212]">
             <h1 className="text-xl font-bold">Statistics</h1>
-            <p className="text-xs text-gray-400">All-time performance</p>
+            <p className="text-xs text-gray-400">Local Device Performance</p>
         </div>
 
         <div className="flex-1 overflow-y-auto p-4 space-y-6">
             
-            {/* Total Time Card */}
             <div className="bg-[#1e1e1e] rounded-xl p-6 border border-gray-800 flex items-center justify-between">
                 <div>
                     <p className="text-gray-400 text-sm mb-1">Total Study Time</p>
@@ -85,7 +63,6 @@ const Stats: React.FC = () => {
                 </div>
             </div>
 
-            {/* Simple Bar Chart */}
             <div className="bg-[#1e1e1e] rounded-xl p-6 border border-gray-800">
                 <h3 className="font-bold mb-4 flex items-center gap-2">
                     <PieChart size={18} className="text-gray-400" /> Subject Breakdown
@@ -115,24 +92,6 @@ const Stats: React.FC = () => {
                     </div>
                 )}
             </div>
-
-            {/* Daily Streak (Mock Visual) */}
-            <div className="bg-[#1e1e1e] rounded-xl p-6 border border-gray-800">
-                <h3 className="font-bold mb-4 flex items-center gap-2">
-                    <Calendar size={18} className="text-gray-400" /> Recent Activity
-                </h3>
-                <div className="flex justify-between">
-                    {['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((day, i) => (
-                        <div key={i} className="flex flex-col items-center gap-2">
-                            <div className={`w-8 h-20 rounded-md ${i === 6 ? 'bg-[#FF6B35]' : 'bg-gray-800'} relative`}>
-                                <div className="absolute bottom-0 w-full bg-white/20" style={{ height: `${Math.random() * 80 + 20}%`}}></div>
-                            </div>
-                            <span className="text-xs text-gray-500">{day}</span>
-                        </div>
-                    ))}
-                </div>
-            </div>
-
         </div>
     </div>
   );

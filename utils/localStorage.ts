@@ -1,80 +1,134 @@
-import { StudySession, Subject } from '../types';
+import { StudySession, Subject, UserProfile } from '../types';
 
-const STORAGE_KEY = 'ypt_guest_sessions';
-const GUEST_FLAG_KEY = 'ypt_is_guest_mode';
-const SUBJECTS_KEY = 'ypt_custom_subjects';
+const KEYS = {
+    USER_ID: 'ypt_local_uid',
+    PROFILE: 'ypt_local_profile',
+    SESSIONS: 'ypt_local_sessions',
+    SUBJECTS: 'ypt_local_subjects',
+    ACTIVE_SESSION: 'ypt_active_session',
+    ROOM_ID: 'ypt_connected_room_id'
+};
 
-// --- Session Management ---
-export const getGuestSessions = (): StudySession[] => {
-  try {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (!stored) return [];
+// --- User Management ---
+export const getLocalUserId = (): string => {
+    let uid = localStorage.getItem(KEYS.USER_ID);
+    if (!uid) {
+        uid = 'user_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+        localStorage.setItem(KEYS.USER_ID, uid);
+    }
+    return uid;
+};
+
+export const getLocalProfile = (): UserProfile => {
+    const stored = localStorage.getItem(KEYS.PROFILE);
+    if (stored) return JSON.parse(stored);
     
-    const parsed = JSON.parse(stored);
-    return parsed.map((s: any) => ({
+    // Default Profile
+    const newProfile: UserProfile = {
+        uid: getLocalUserId(),
+        displayName: 'Student',
+        photoURL: null,
+        isStudying: false,
+        studyTimeToday: 0
+    };
+    saveLocalProfile(newProfile);
+    return newProfile;
+};
+
+export const saveLocalProfile = (profile: UserProfile) => {
+    localStorage.setItem(KEYS.PROFILE, JSON.stringify(profile));
+};
+
+export const updateLocalProfileName = (name: string) => {
+    const p = getLocalProfile();
+    p.displayName = name;
+    saveLocalProfile(p);
+    return p;
+};
+
+// --- Subjects ---
+const DEFAULT_SUBJECTS: Subject[] = [
+  { id: '1', name: 'Mathematics', color: '#008080' },
+  { id: '2', name: 'Physics', color: '#CD5C5C' },
+  { id: '3', name: 'Chemistry', color: '#708090' },
+  { id: '4', name: 'English', color: '#E9967A' },
+  { id: '5', name: 'Coding', color: '#6A5ACD' },
+];
+
+export const getLocalSubjects = (): Subject[] => {
+    const stored = localStorage.getItem(KEYS.SUBJECTS);
+    if (stored) return JSON.parse(stored);
+    localStorage.setItem(KEYS.SUBJECTS, JSON.stringify(DEFAULT_SUBJECTS));
+    return DEFAULT_SUBJECTS;
+};
+
+export const saveLocalSubject = (subject: Subject) => {
+    const subjects = getLocalSubjects();
+    subjects.push(subject);
+    localStorage.setItem(KEYS.SUBJECTS, JSON.stringify(subjects));
+    return subjects;
+};
+
+// --- Sessions ---
+export const getLocalSessions = (): StudySession[] => {
+    const stored = localStorage.getItem(KEYS.SESSIONS);
+    if (!stored) return [];
+    return JSON.parse(stored).map((s: any) => ({
         ...s,
         startTime: new Date(s.startTime),
         endTime: s.endTime ? new Date(s.endTime) : null
     }));
-  } catch (e) {
-    console.error("Failed to load guest sessions", e);
-    return [];
-  }
 };
 
-export const saveGuestSession = (session: Omit<StudySession, 'id'>) => {
-    const sessions = getGuestSessions();
-    const newSession = { ...session, id: `local_${Date.now()}` };
-    sessions.push(newSession as StudySession);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions));
-    return newSession.id;
+export const saveLocalSession = (session: StudySession) => {
+    const sessions = getLocalSessions();
+    // Check if exists (for updates)
+    const index = sessions.findIndex(s => s.id === session.id);
+    if (index >= 0) {
+        sessions[index] = session;
+    } else {
+        sessions.push(session);
+    }
+    localStorage.setItem(KEYS.SESSIONS, JSON.stringify(sessions));
 };
 
-export const deleteGuestSession = (sessionId: string) => {
-    let sessions = getGuestSessions();
-    sessions = sessions.filter(s => s.id !== sessionId);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions));
+export const deleteLocalSession = (id: string) => {
+    const sessions = getLocalSessions().filter(s => s.id !== id);
+    localStorage.setItem(KEYS.SESSIONS, JSON.stringify(sessions));
 };
 
-export const getGuestTodayTotal = (): number => {
-    const sessions = getGuestSessions();
-    const today = new Date();
-    today.setHours(0,0,0,0);
+export const getTodayTotalSeconds = (): number => {
+    const sessions = getLocalSessions();
+    const now = new Date();
+    // Logic: Day starts at 4AM
+    if (now.getHours() < 4) now.setDate(now.getDate() - 1);
+    now.setHours(4, 0, 0, 0);
 
     return sessions
-        .filter(s => {
-            const d = s.startTime instanceof Date ? s.startTime : new Date(s.startTime);
-            return d >= today;
-        })
+        .filter(s => s.startTime >= now)
         .reduce((acc, curr) => acc + curr.durationSeconds, 0);
 };
 
-// --- Auth Persistence ---
-export const setGuestMode = (isGuest: boolean) => {
-    if (isGuest) {
-        localStorage.setItem(GUEST_FLAG_KEY, 'true');
-    } else {
-        localStorage.removeItem(GUEST_FLAG_KEY);
-    }
+// --- Resume State (Active Timer) ---
+export const saveActiveSessionState = (sessionData: any) => {
+    localStorage.setItem(KEYS.ACTIVE_SESSION, JSON.stringify(sessionData));
 };
 
-export const isGuestModeActive = (): boolean => {
-    return localStorage.getItem(GUEST_FLAG_KEY) === 'true';
+export const getActiveSessionState = () => {
+    const stored = localStorage.getItem(KEYS.ACTIVE_SESSION);
+    return stored ? JSON.parse(stored) : null;
 };
 
-// --- Custom Subjects ---
-export const getStoredSubjects = (): Subject[] => {
-    try {
-        const stored = localStorage.getItem(SUBJECTS_KEY);
-        return stored ? JSON.parse(stored) : [];
-    } catch {
-        return [];
-    }
+export const clearActiveSessionState = () => {
+    localStorage.removeItem(KEYS.ACTIVE_SESSION);
 };
 
-export const saveStoredSubject = (subject: Subject) => {
-    const current = getStoredSubjects();
-    const updated = [...current, subject];
-    localStorage.setItem(SUBJECTS_KEY, JSON.stringify(updated));
-    return updated;
+// --- Room ---
+export const getConnectedRoomId = (): string | null => {
+    return localStorage.getItem(KEYS.ROOM_ID);
+};
+
+export const setConnectedRoomId = (roomId: string | null) => {
+    if (roomId) localStorage.setItem(KEYS.ROOM_ID, roomId);
+    else localStorage.removeItem(KEYS.ROOM_ID);
 };

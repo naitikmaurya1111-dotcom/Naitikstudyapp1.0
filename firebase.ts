@@ -1,14 +1,14 @@
 import { initializeApp } from "firebase/app";
 import { 
   getAuth, 
-  GoogleAuthProvider, 
-  signInWithPopup, 
-  signOut, 
+  signInAnonymously,
   onAuthStateChanged,
-  updateProfile,
-  User,
+  GoogleAuthProvider,
+  signInWithPopup,
+  signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
-  signInWithEmailAndPassword
+  updateProfile,
+  linkWithPopup
 } from "firebase/auth";
 import { 
   getFirestore, 
@@ -21,19 +21,18 @@ import {
   where, 
   onSnapshot, 
   addDoc,
-  Timestamp,
   getDoc, 
   arrayUnion,
   increment,
   deleteDoc,
   orderBy,
   limit,
-  runTransaction,
-  writeBatch,
-  getDocs
+  runTransaction
 } from "firebase/firestore";
-import { GroupSettings } from "./types";
+import { Room, StudySession, UserProfile } from "./types";
 
+// NOTE: Use your own Firebase Config here for Room Syncing to work.
+// If config is invalid, app works in "Offline Mode".
 const firebaseConfig = {
   apiKey: "AIzaSyCHr1R12hY6cqUKjTqSL3RDnZvbRvGtX0g",
   authDomain: "naitikstudyapp1.firebaseapp.com",
@@ -48,382 +47,197 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const db = getFirestore(app);
-const provider = new GoogleAuthProvider();
 
-// Add scope for Google Calendar
-provider.addScope('https://www.googleapis.com/auth/calendar.readonly');
+// Initialize Anonymous Auth immediately (fallback)
+signInAnonymously(auth).catch((error) => {
+    console.log("Offline Mode: Could not connect to Firebase (Check config)", error);
+});
 
-// Auth Functions
+// --- AUTH FUNCTIONS ---
 
-export const registerWithEmailPassword = async (name: string, email: string, pass: string) => {
+export const loginWithGoogle = async () => {
+    const provider = new GoogleAuthProvider();
+    // Request read-only access to Calendar
+    provider.addScope('https://www.googleapis.com/auth/calendar.readonly');
+    
+    let result;
     try {
-        const result = await createUserWithEmailAndPassword(auth, email, pass);
-        const user = result.user;
-        
-        // Update auth profile
-        await updateProfile(user, { displayName: name });
-
-        // Create user document
-        const userRef = doc(db, 'users', user.uid);
-        await setDoc(userRef, {
-            uid: user.uid,
-            displayName: name,
-            email: user.email,
-            photoURL: null, 
-            lastActive: serverTimestamp(),
-            studyTimeToday: 0
-        });
-        return user;
-    } catch (error) {
-        console.error("Error registering:", error);
+        result = await signInWithPopup(auth, provider);
+    } catch (error: any) {
+        // Handle credential already in use by linking if necessary, 
+        // or just throw to let UI handle it. 
+        // For this app's simple flow, re-throwing is safest.
+        console.error("Google Sign In Error", error);
         throw error;
     }
+
+    // Get the Google Access Token for Calendar API
+    const credential = GoogleAuthProvider.credentialFromResult(result);
+    const token = credential?.accessToken; 
+    const user = result.user;
+    
+    // Create/Update user in Firestore
+    if (user) {
+        const userRef = doc(db, 'users', user.uid);
+        await setDoc(userRef, {
+          uid: user.uid,
+          displayName: user.displayName,
+          email: user.email,
+          photoURL: user.photoURL,
+          lastActive: serverTimestamp(),
+        }, { merge: true });
+    }
+
+    return { user, token };
 };
 
 export const loginWithEmailPassword = async (email: string, pass: string) => {
+    return await signInWithEmailAndPassword(auth, email, pass);
+};
+
+export const registerWithEmailPassword = async (name: string, email: string, pass: string) => {
+    const result = await createUserWithEmailAndPassword(auth, email, pass);
+    if (result.user) {
+        await updateProfile(result.user, { displayName: name });
+    }
+    return result;
+};
+
+// --- SYNC FUNCTIONS (Local -> Cloud) ---
+
+export const syncUserProfileToRoom = async (profile: UserProfile, roomId: string) => {
     try {
-        const result = await signInWithEmailAndPassword(auth, email, pass);
-        const user = result.user;
-
-        const userRef = doc(db, 'users', user.uid);
+        const userRef = doc(db, 'rooms', roomId, 'members', profile.uid);
         await setDoc(userRef, {
-            uid: user.uid,
-            email: user.email,
-            lastActive: serverTimestamp()
+            ...profile,
+            lastActive: serverTimestamp(), // Use server timestamp for accuracy
         }, { merge: true });
-
-        return user;
-    } catch (error) {
-        console.error("Error logging in:", error);
-        throw error;
+    } catch (e) {
+        console.warn("Sync failed (Offline?)");
     }
 };
 
-export const loginWithGoogle = async () => {
-  try {
-    const result = await signInWithPopup(auth, provider);
-    const credential = GoogleAuthProvider.credentialFromResult(result);
-    const token = credential?.accessToken;
-    const user = result.user;
-    
-    const userRef = doc(db, 'users', user.uid);
-    // Don't overwrite existing fields like studyTimeToday if they exist
-    await setDoc(userRef, {
-      uid: user.uid,
-      displayName: user.displayName,
-      email: user.email,
-      photoURL: user.photoURL,
-      lastActive: serverTimestamp(),
-    }, { merge: true });
-
-    return { user, token };
-  } catch (error) {
-    console.error("Error logging in:", error);
-    throw error;
-  }
-};
-
-export const logout = async () => {
-  await signOut(auth);
-};
-
-export const updateUserProfileName = async (user: User, name: string) => {
-    await updateProfile(user, { displayName: name });
-    const userRef = doc(db, 'users', user.uid);
-    await updateDoc(userRef, { displayName: name });
-};
-
-// --- STUDY LOGIC & HEARTBEAT ---
-
-export const sendHeartbeat = async (uid: string) => {
+export const syncSessionToRoom = async (session: StudySession, roomId: string) => {
     try {
-        const userRef = doc(db, 'users', uid);
-        await updateDoc(userRef, {
+        // We store sessions in a subcollection of the room for stats
+        const sessionRef = doc(db, 'rooms', roomId, 'sessions', session.id);
+        await setDoc(sessionRef, {
+            ...session,
+            startTime: session.startTime, // Firestore handles JS Date objects
+            endTime: session.endTime
+        });
+        
+        // Update member total
+        const memberRef = doc(db, 'rooms', roomId, 'members', session.userId);
+        await updateDoc(memberRef, {
+            studyTimeToday: increment(session.durationSeconds),
+            isStudying: false,
+            lastActive: serverTimestamp()
+        });
+
+    } catch (e) {
+        console.warn("Sync session failed");
+    }
+};
+
+export const updateRoomStatus = async (roomId: string, userId: string, isStudying: boolean, subject?: string) => {
+    try {
+        const memberRef = doc(db, 'rooms', roomId, 'members', userId);
+        await updateDoc(memberRef, {
+            isStudying,
+            currentSubject: isStudying ? subject : null,
             lastActive: serverTimestamp()
         });
     } catch (e) {
-        console.error("Heartbeat failed", e);
+        console.warn("Status update failed");
     }
 };
 
-export const updateUserStatus = async (uid: string, isStudying: boolean, currentSubject?: string) => {
-  const userRef = doc(db, 'users', uid);
-  await updateDoc(userRef, {
-    isStudying,
-    currentSubject: isStudying ? currentSubject : null,
-    lastActive: serverTimestamp()
-  });
+// --- ROOM LOGIC ---
+
+export const createRoom = async (ownerId: string, name: string, password?: string, description?: string) => {
+    const roomRef = await addDoc(collection(db, 'rooms'), {
+        name,
+        password: password || '', // Simple password check
+        description: description || '',
+        ownerId,
+        memberCount: 1,
+        members: [ownerId],
+        createdAt: serverTimestamp()
+    });
+    return roomRef.id;
 };
 
-export const startStudySession = async (uid: string, subjectId: string, subjectName: string, subjectColor: string) => {
-  await updateUserStatus(uid, true, subjectName);
-  const sessionRef = await addDoc(collection(db, 'sessions'), {
-    userId: uid,
-    subjectId,
-    subjectName,
-    subjectColor,
-    startTime: serverTimestamp(),
-    endTime: null,
-    durationSeconds: 0
-  });
-  return sessionRef.id;
-};
-
-export const endStudySession = async (uid: string, sessionId: string, duration: number, memo: string = "") => {
-  await updateUserStatus(uid, false);
-  const sessionRef = doc(db, 'sessions', sessionId);
-  await updateDoc(sessionRef, {
-    endTime: serverTimestamp(),
-    durationSeconds: duration,
-    memo: memo
-  });
-  
-  const userRef = doc(db, 'users', uid);
-  await updateDoc(userRef, {
-    studyTimeToday: increment(duration)
-  });
-};
-
-export const deleteSession = async (uid: string, sessionId: string, duration: number) => {
-  await deleteDoc(doc(db, 'sessions', sessionId));
-  const userRef = doc(db, 'users', uid);
-  await updateDoc(userRef, {
-    studyTimeToday: increment(-duration)
-  });
-};
-
-export const updateSessionDuration = async (uid: string, sessionId: string, oldDuration: number, newDuration: number) => {
-    const sessionRef = doc(db, 'sessions', sessionId);
-    const userRef = doc(db, 'users', uid);
+export const joinRoomWithPassword = async (roomId: string, passwordInput: string, userId: string) => {
+    const roomRef = doc(db, 'rooms', roomId);
     
-    const batch = writeBatch(db);
+    // 1. Check Password
+    const roomSnap = await getDoc(roomRef);
+    if (!roomSnap.exists()) {
+        throw new Error("Room not found");
+    }
     
-    // Update Session
-    batch.update(sessionRef, {
-        durationSeconds: newDuration,
-        // Approximate end time adjustment based on new duration
-        // logic: endTime = startTime + newDuration
+    const roomData = roomSnap.data();
+    if (roomData.password && roomData.password !== passwordInput) {
+        throw new Error("Incorrect Password");
+    }
+
+    // 2. Join (Transaction for safety)
+    await runTransaction(db, async (transaction) => {
+        const sfDoc = await transaction.get(roomRef);
+        if (!sfDoc.exists()) throw "Room does not exist!";
+
+        const members = sfDoc.data().members || [];
+        if (!members.includes(userId)) {
+             transaction.update(roomRef, {
+                members: arrayUnion(userId),
+                memberCount: increment(1)
+            });
+        }
     });
 
-    // Update User Total
-    const diff = newDuration - oldDuration;
-    if (diff !== 0) {
-        batch.update(userRef, {
-            studyTimeToday: increment(diff)
+    return roomData;
+};
+
+// --- LISTENERS ---
+
+export const subscribeToRoomMembers = (roomId: string, callback: (members: any[]) => void) => {
+    const q = collection(db, 'rooms', roomId, 'members');
+    return onSnapshot(q, (snapshot) => {
+        const members = snapshot.docs.map(doc => {
+            const data = doc.data();
+            // Convert timestamp to number for local app consistency
+            const lastActive = data.lastActive?.toMillis ? data.lastActive.toMillis() : Date.now();
+            return { ...data, uid: doc.id, lastActive };
         });
-    }
-
-    await batch.commit();
-};
-
-// --- GROUP FEATURES ---
-
-export const createGroup = async (userId: string, name: string, description: string, category: string) => {
-  const defaultSettings: GroupSettings = {
-      dailyGoalSeconds: 7 * 3600, // 7 Hours default
-      maxCapacity: 50,
-      category: category,
-      isPublic: true,
-      nicknameRules: true,
-      intro: description
-  };
-
-  const groupRef = await addDoc(collection(db, 'groups'), {
-    name,
-    description,
-    ownerId: userId,
-    memberCount: 1,
-    members: [userId],
-    createdAt: serverTimestamp(),
-    settings: defaultSettings
-  });
-
-  const userRef = doc(db, 'users', userId);
-  await updateDoc(userRef, {
-    joinedGroupIds: arrayUnion(groupRef.id)
-  });
-
-  return groupRef.id;
-};
-
-// STRONG JOIN: Uses Transaction to prevent race conditions exceeding capacity
-export const joinGroup = async (userId: string, groupId: string) => {
-  const groupRef = doc(db, 'groups', groupId);
-  const userRef = doc(db, 'users', userId);
-
-  await runTransaction(db, async (transaction) => {
-      const groupDoc = await transaction.get(groupRef);
-      if (!groupDoc.exists()) {
-          throw new Error("Group does not exist!");
-      }
-
-      const data = groupDoc.data();
-      const currentMembers = data.members || [];
-      const capacity = data.settings?.maxCapacity || 50;
-
-      if (currentMembers.includes(userId)) {
-          return; // Already joined
-      }
-
-      if (data.memberCount >= capacity) {
-          throw new Error("Group is full!");
-      }
-
-      transaction.update(groupRef, {
-          members: arrayUnion(userId),
-          memberCount: increment(1)
-      });
-
-      transaction.update(userRef, {
-          joinedGroupIds: arrayUnion(groupId)
-      });
-  });
-};
-
-export const updateGroupSettings = async (groupId: string, settings: Partial<GroupSettings>) => {
-    const groupRef = doc(db, 'groups', groupId);
-    const updateData: any = {};
-    Object.entries(settings).forEach(([key, value]) => {
-        updateData[`settings.${key}`] = value;
+        callback(members);
     });
-    await updateDoc(groupRef, updateData);
 };
 
-export const deleteGroup = async (groupId: string) => {
-    // 1. Get group to find members
-    const groupRef = doc(db, 'groups', groupId);
-    const groupSnap = await getDoc(groupRef);
-    if (!groupSnap.exists()) return;
-    
-    // 2. Remove group ID from all members (Ideally done via Cloud Functions, but doing client-side best effort here)
-    // Note: This might be slow for large groups client-side.
-    // In production, just delete the group doc and let a background trigger clean up users.
-    await deleteDoc(groupRef);
-};
-
-
-// --- CHAT FEATURES ---
-
-export const sendGroupMessage = async (groupId: string, user: User, text: string) => {
-  await addDoc(collection(db, `groups/${groupId}/messages`), {
-    userId: user.uid,
-    userName: user.displayName || 'Anonymous',
-    photoURL: user.photoURL,
-    text,
-    createdAt: serverTimestamp()
-  });
-};
-
-export const subscribeToGroupMessages = (groupId: string, callback: (messages: any[]) => void) => {
-  const q = query(
-    collection(db, `groups/${groupId}/messages`),
-    orderBy('createdAt', 'asc'),
-    limit(50)
-  );
-  return onSnapshot(q, (snapshot) => {
-    const messages = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    callback(messages);
-  });
-};
-
-
-// Real-time Listeners
-
-export const subscribeToUserGroups = (userId: string, callback: (groups: any[]) => void) => {
-  const q = query(collection(db, 'groups'), where('members', 'array-contains', userId));
-  return onSnapshot(q, (snapshot) => {
-    const groups = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    callback(groups);
-  });
-};
-
-export const subscribeToGroupMembers = (groupId: string, callback: (members: any[]) => void) => {
-  // Queries users who have this groupId in their joined list
-  const q = query(collection(db, 'users'), where('joinedGroupIds', 'array-contains', groupId)); 
-  return onSnapshot(q, (snapshot) => {
-    // CRITICAL FIX: Ensure 'uid' is explicitly part of the returned object
-    const members = snapshot.docs.map(doc => {
-        const data = doc.data();
-        return { uid: doc.id, ...data };
-    });
-    callback(members);
-  });
-};
-
-export const subscribeToGroupDetails = (groupId: string, callback: (data: any) => void) => {
-  const docRef = doc(db, 'groups', groupId);
-  return onSnapshot(docRef, (doc) => {
-    if (doc.exists()) {
-      callback({ id: doc.id, ...doc.data() });
-    }
-  });
-};
-
-export const subscribeToTodaySessions = (uid: string, callback: (sessions: any[]) => void) => {
-  // OPTIMIZED: Use server-side Timestamp filtering with 4 AM logic
-  const now = new Date();
-  
-  // If current time is before 4 AM, we are technically in "yesterday's" study day
-  if (now.getHours() < 4) {
-      now.setDate(now.getDate() - 1);
-  }
-
-  const startOfDay = new Date(now);
-  startOfDay.setHours(4, 0, 0, 0); // 4 AM start
-  
-  const endOfDay = new Date(now);
-  endOfDay.setDate(endOfDay.getDate() + 1);
-  endOfDay.setHours(4, 0, 0, 0); // 4 AM next day end
-
-  const q = query(
-      collection(db, 'sessions'), 
-      where('userId', '==', uid),
-      where('startTime', '>=', startOfDay),
-      where('startTime', '<=', endOfDay)
-  );
-
-  return onSnapshot(q, (snapshot) => {
-    const sessions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    callback(sessions);
-  });
-};
-
-export const subscribeToHistorySessions = (uid: string, callback: (sessions: any[]) => void) => {
-  const q = query(
-      collection(db, 'sessions'), 
-      where('userId', '==', uid),
-      orderBy('startTime', 'desc'),
-      limit(200)
-  );
-  
-  return onSnapshot(q, (snapshot) => {
-    const sessions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    callback(sessions);
-  });
-};
-
-// Helper to fetch attendance for multiple users for a date range (Not real-time, one-off fetch)
-export const fetchGroupWeeklyStats = async (memberIds: string[], startDate: Date, endDate: Date) => {
-    if (memberIds.length === 0) return [];
-    
-    // Firestore 'in' query supports max 10 items. If > 10, we'd need multiple queries. 
-    // For simplicity in this clone, we'll fetch sessions for the range and filter in memory if group is large, 
-    // OR just fetch per user if group is small.
-    // Better strategy: Store daily aggregates in a subcollection `users/{uid}/daily_stats/{date}`.
-    
-    // Fallback implementation: Query sessions in range.
-    // Warning: Index required for complex queries.
-    
+export const subscribeToRoomChat = (roomId: string, callback: (msgs: any[]) => void) => {
     const q = query(
-        collection(db, 'sessions'),
-        where('startTime', '>=', startDate),
-        where('startTime', '<=', endDate),
-        // orderBy('startTime', 'desc') // Requires composite index
+        collection(db, 'rooms', roomId, 'messages'),
+        orderBy('createdAt', 'asc'),
+        limit(50)
     );
+    return onSnapshot(q, (snapshot) => {
+        const msgs = snapshot.docs.map(doc => {
+            const data = doc.data();
+            return { 
+                ...data, 
+                id: doc.id, 
+                createdAt: data.createdAt?.toMillis ? data.createdAt.toMillis() : Date.now() 
+            };
+        });
+        callback(msgs);
+    });
+};
 
-    const snapshot = await getDocs(q);
-    const sessions = snapshot.docs.map(doc => doc.data());
-    
-    // Filter for members only (since we can't 'in' query easily with date range without specific index)
-    return sessions.filter(s => memberIds.includes(s.userId));
+export const sendRoomMessage = async (roomId: string, userId: string, userName: string, text: string) => {
+    await addDoc(collection(db, 'rooms', roomId, 'messages'), {
+        userId,
+        userName,
+        text,
+        createdAt: serverTimestamp()
+    });
 };
