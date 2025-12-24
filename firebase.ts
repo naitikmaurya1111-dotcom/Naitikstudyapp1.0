@@ -6,7 +6,9 @@ import {
   signOut, 
   onAuthStateChanged,
   updateProfile,
-  User 
+  User,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword
 } from "firebase/auth";
 import { 
   getFirestore, 
@@ -20,7 +22,7 @@ import {
   onSnapshot, 
   addDoc,
   Timestamp,
-  getDoc,
+  getDoc, 
   arrayUnion,
   increment,
   deleteDoc,
@@ -35,6 +37,7 @@ import { GroupSettings } from "./types";
 const firebaseConfig = {
   apiKey: "AIzaSyCHr1R12hY6cqUKjTqSL3RDnZvbRvGtX0g",
   authDomain: "naitikstudyapp1.firebaseapp.com",
+  databaseURL: "https://naitikstudyapp1-default-rtdb.firebaseio.com",
   projectId: "naitikstudyapp1",
   storageBucket: "naitikstudyapp1.firebasestorage.app",
   messagingSenderId: "111741373060",
@@ -51,6 +54,51 @@ const provider = new GoogleAuthProvider();
 provider.addScope('https://www.googleapis.com/auth/calendar.readonly');
 
 // Auth Functions
+
+export const registerWithEmailPassword = async (name: string, email: string, pass: string) => {
+    try {
+        const result = await createUserWithEmailAndPassword(auth, email, pass);
+        const user = result.user;
+        
+        // Update auth profile
+        await updateProfile(user, { displayName: name });
+
+        // Create user document
+        const userRef = doc(db, 'users', user.uid);
+        await setDoc(userRef, {
+            uid: user.uid,
+            displayName: name,
+            email: user.email,
+            photoURL: null, 
+            lastActive: serverTimestamp(),
+            studyTimeToday: 0
+        });
+        return user;
+    } catch (error) {
+        console.error("Error registering:", error);
+        throw error;
+    }
+};
+
+export const loginWithEmailPassword = async (email: string, pass: string) => {
+    try {
+        const result = await signInWithEmailAndPassword(auth, email, pass);
+        const user = result.user;
+
+        const userRef = doc(db, 'users', user.uid);
+        await setDoc(userRef, {
+            uid: user.uid,
+            email: user.email,
+            lastActive: serverTimestamp()
+        }, { merge: true });
+
+        return user;
+    } catch (error) {
+        console.error("Error logging in:", error);
+        throw error;
+    }
+};
+
 export const loginWithGoogle = async () => {
   try {
     const result = await signInWithPopup(auth, provider);
@@ -88,10 +136,14 @@ export const updateUserProfileName = async (user: User, name: string) => {
 // --- STUDY LOGIC & HEARTBEAT ---
 
 export const sendHeartbeat = async (uid: string) => {
-    const userRef = doc(db, 'users', uid);
-    await updateDoc(userRef, {
-        lastActive: serverTimestamp()
-    });
+    try {
+        const userRef = doc(db, 'users', uid);
+        await updateDoc(userRef, {
+            lastActive: serverTimestamp()
+        });
+    } catch (e) {
+        console.error("Heartbeat failed", e);
+    }
 };
 
 export const updateUserStatus = async (uid: string, isStudying: boolean, currentSubject?: string) => {
@@ -289,7 +341,11 @@ export const subscribeToGroupMembers = (groupId: string, callback: (members: any
   // Queries users who have this groupId in their joined list
   const q = query(collection(db, 'users'), where('joinedGroupIds', 'array-contains', groupId)); 
   return onSnapshot(q, (snapshot) => {
-    const members = snapshot.docs.map(doc => doc.data());
+    // CRITICAL FIX: Ensure 'uid' is explicitly part of the returned object
+    const members = snapshot.docs.map(doc => {
+        const data = doc.data();
+        return { uid: doc.id, ...data };
+    });
     callback(members);
   });
 };

@@ -44,20 +44,23 @@ const TimerOverlay: React.FC<TimerOverlayProps> = ({ isOpen, onClose, subjects, 
     }
   }, [subjects]);
 
-  // Effect: Page Visibility (Focus Guard / Anti-Cheat)
+  // Effect: Page Visibility (Focus Guard / Anti-Cheat / Heartbeat Recovery)
   useEffect(() => {
     const handleVisibilityChange = () => {
-      if (document.hidden && timerState === 'RUNNING' && !isRestMode) {
-        // Option 1: Pause Timer
-        // pauseTimer(); 
-        
-        // Option 2: Just Log it (Soft Anti-Cheat)
-        console.warn("User switched tabs!");
+      if (document.hidden) {
+         if (timerState === 'RUNNING' && !isRestMode) {
+             console.warn("User switched tabs!");
+         }
+      } else {
+          // User came back. Force a heartbeat to show them as online immediately.
+          if (timerState === 'RUNNING' && !isRestMode && user && !isGuest) {
+              sendHeartbeat(user.uid);
+          }
       }
     };
     document.addEventListener("visibilitychange", handleVisibilityChange);
     return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
-  }, [timerState, isRestMode]);
+  }, [timerState, isRestMode, user, isGuest]);
 
   const formatTime = (totalSeconds: number) => {
     const h = Math.floor(totalSeconds / 3600);
@@ -77,8 +80,11 @@ const TimerOverlay: React.FC<TimerOverlayProps> = ({ isOpen, onClose, subjects, 
             setSessionId(sid);
             
             // START HEARTBEAT
-            // Update "lastActive" every 30 seconds to show others I am online and studying
+            // 1. Send immediately
             sendHeartbeat(user.uid);
+            
+            // 2. Schedule interval (every 30s)
+            if (heartbeatRef.current) clearInterval(heartbeatRef.current);
             heartbeatRef.current = window.setInterval(() => {
                 sendHeartbeat(user.uid);
             }, 30000);
